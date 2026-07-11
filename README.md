@@ -6,7 +6,7 @@ Single-binary HTTP + SOCKS5 proxy with DNS cache. Zero deps. Run on one device, 
 
 ```bash
 pkg install wget
-wget https://github.com/tundefund0-gif/netproxy/releases/latest/download/netproxy_arm64
+wget https://github.com/tundefund0-gif/netproxy/releases/download/v1.0.0/netproxy_arm64
 chmod +x netproxy_arm64
 mv netproxy_arm64 $PREFIX/bin/netproxy
 netproxy -http 8080 -socks 1080
@@ -22,13 +22,21 @@ export PATH=$PATH:$(go env GOPATH)/bin
 netproxy -http 8080 -socks 1080
 ```
 
-## Download binary
+## Download binary directly
 
-| Platform | Link |
-|----------|------|
-| Linux amd64 | [netproxy_amd64](https://github.com/tundefund0-gif/netproxy/releases/latest/download/netproxy_amd64) |
-| Linux arm64 | [netproxy_arm64](https://github.com/tundefund0-gif/netproxy/releases/latest/download/netproxy_arm64) |
-| Linux armv7 | [netproxy_armv7](https://github.com/tundefund0-gif/netproxy/releases/latest/download/netproxy_armv7) |
+```bash
+# amd64
+wget -O netproxy https://github.com/tundefund0-gif/netproxy/releases/download/v1.0.0/netproxy_amd64
+
+# arm64 (modern phones, Raspberry Pi 3+)
+wget -O netproxy https://github.com/tundefund0-gif/netproxy/releases/download/v1.0.0/netproxy_arm64
+
+# armv7 (older phones)
+wget -O netproxy https://github.com/tundefund0-gif/netproxy/releases/download/v1.0.0/netproxy_armv7
+
+chmod +x netproxy
+./netproxy
+```
 
 ## Usage
 
