@@ -11,41 +11,41 @@ import (
 )
 
 const (
-	socksVer5         = 5
-	socksCmdConnect   = 1
-	socksAtypIPv4    = 1
-	socksAtypDomain  = 3
-	socksAtypIPv6    = 4
-	socksAuthNone    = 0
+	socksVer5          = 5
+	socksCmdConnect    = 1
+	socksAtypIPv4     = 1
+	socksAtypDomain   = 3
+	socksAtypIPv6     = 4
+	socksAuthNone     = 0
 	socksAuthUserPass = 2
 )
 
-var socksAuth string // "user:pass" or empty
+var socksAuth string
 
-func SetSocksAuth(auth string) {
-	socksAuth = auth
-}
+func SetSocksAuth(auth string) { socksAuth = auth }
 
 func HandleSOCKS5(conn net.Conn, dns *DNSCache) {
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(30 * time.Second))
+	tcpConn := conn.(*net.TCPConn)
+	tcpConn.SetNoDelay(true)
+	tcpConn.SetKeepAlive(true)
+	tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	conn.SetDeadline(time.Now().Add(60 * time.Second))
 
 	buf := make([]byte, 257)
-	_, err := io.ReadFull(conn, buf[:2])
-	if err != nil || buf[0] != socksVer5 {
+
+	if _, err := io.ReadFull(conn, buf[:2]); err != nil || buf[0] != socksVer5 {
 		return
 	}
 	nMethods := int(buf[1])
 	if nMethods < 1 || nMethods > 255 {
 		return
 	}
-	_, err = io.ReadFull(conn, buf[:nMethods])
-	if err != nil {
+	if _, err := io.ReadFull(conn, buf[:nMethods]); err != nil {
 		return
 	}
 
-	hasUserPass := false
-	hasNone := false
+	hasUserPass, hasNone := false, false
 	for i := 0; i < nMethods; i++ {
 		switch buf[i] {
 		case socksAuthUserPass:
@@ -61,29 +61,25 @@ func HandleSOCKS5(conn net.Conn, dns *DNSCache) {
 			return
 		}
 		conn.Write([]byte{socksVer5, socksAuthUserPass})
-		_, err = io.ReadFull(conn, buf[:2])
-		if err != nil || buf[0] != 1 {
+		if _, err := io.ReadFull(conn, buf[:2]); err != nil || buf[0] != 1 {
 			return
 		}
 		ulen := int(buf[1])
 		if ulen < 1 || ulen > 255 {
 			return
 		}
-		_, err = io.ReadFull(conn, buf[:ulen])
-		if err != nil {
+		if _, err := io.ReadFull(conn, buf[:ulen]); err != nil {
 			return
 		}
 		user := string(buf[:ulen])
-		_, err = io.ReadFull(conn, buf[:1])
-		if err != nil {
+		if _, err := io.ReadFull(conn, buf[:1]); err != nil {
 			return
 		}
 		plen := int(buf[0])
 		if plen < 1 || plen > 255 {
 			return
 		}
-		_, err = io.ReadFull(conn, buf[:plen])
-		if err != nil {
+		if _, err := io.ReadFull(conn, buf[:plen]); err != nil {
 			return
 		}
 		pass := string(buf[:plen])
@@ -100,42 +96,37 @@ func HandleSOCKS5(conn net.Conn, dns *DNSCache) {
 		conn.Write([]byte{socksVer5, socksAuthNone})
 	}
 
-	_, err = io.ReadFull(conn, buf[:4])
-	if err != nil {
+	if _, err := io.ReadFull(conn, buf[:4]); err != nil {
 		return
 	}
-	ver, cmd, atyp := buf[0], buf[1], buf[3]
-	if ver != socksVer5 || cmd != socksCmdConnect {
+	if buf[0] != socksVer5 || buf[1] != socksCmdConnect {
 		return
 	}
+	atyp := buf[3]
 
 	var host string
 	var port int
 
 	switch atyp {
 	case socksAtypIPv4:
-		_, err = io.ReadFull(conn, buf[:4])
-		if err != nil {
+		if _, err := io.ReadFull(conn, buf[:4]); err != nil {
 			return
 		}
 		host = net.IP(buf[:4]).String()
 	case socksAtypDomain:
-		_, err = io.ReadFull(conn, buf[:1])
-		if err != nil {
+		if _, err := io.ReadFull(conn, buf[:1]); err != nil {
 			return
 		}
 		domainLen := int(buf[0])
 		if domainLen > 255 {
 			return
 		}
-		_, err = io.ReadFull(conn, buf[:domainLen])
-		if err != nil {
+		if _, err := io.ReadFull(conn, buf[:domainLen]); err != nil {
 			return
 		}
 		host = string(buf[:domainLen])
 	case socksAtypIPv6:
-		_, err = io.ReadFull(conn, buf[:16])
-		if err != nil {
+		if _, err := io.ReadFull(conn, buf[:16]); err != nil {
 			return
 		}
 		host = net.IP(buf[:16]).String()
@@ -143,12 +134,10 @@ func HandleSOCKS5(conn net.Conn, dns *DNSCache) {
 		return
 	}
 
-	_, err = io.ReadFull(conn, buf[:2])
-	if err != nil {
+	if _, err := io.ReadFull(conn, buf[:2]); err != nil {
 		return
 	}
 	port = int(binary.BigEndian.Uint16(buf[:2]))
-
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
 
 	if atyp == socksAtypDomain {
@@ -166,6 +155,7 @@ func HandleSOCKS5(conn net.Conn, dns *DNSCache) {
 		return
 	}
 	defer target.Close()
+	target.(*net.TCPConn).SetNoDelay(true)
 
 	local := target.LocalAddr().(*net.TCPAddr)
 	resp := []byte{socksVer5, 0, 0, socksAtypIPv4}
@@ -175,7 +165,17 @@ func HandleSOCKS5(conn net.Conn, dns *DNSCache) {
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { io.Copy(target, conn); wg.Done() }()
-	go func() { io.Copy(conn, target); wg.Done() }()
+	go func() {
+		b := *bufPool.Get().(*[]byte)
+		defer bufPool.Put(&b)
+		io.CopyBuffer(target, conn, b)
+		wg.Done()
+	}()
+	go func() {
+		b := *bufPool.Get().(*[]byte)
+		defer bufPool.Put(&b)
+		io.CopyBuffer(conn, target, b)
+		wg.Done()
+	}()
 	wg.Wait()
 }

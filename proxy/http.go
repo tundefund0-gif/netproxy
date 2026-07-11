@@ -12,17 +12,26 @@ import (
 	"time"
 )
 
+var proxyAuth string
+
+func SetProxyAuth(auth string) { proxyAuth = auth }
+
+var bufPool = sync.Pool{New: func() any { b := make([]byte, 32768); return &b }}
+
 func HandleHTTP(conn net.Conn, dns *DNSCache) {
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(30 * time.Second))
+	tcpConn := conn.(*net.TCPConn)
+	tcpConn.SetNoDelay(true)
+	tcpConn.SetKeepAlive(true)
+	tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	conn.SetDeadline(time.Now().Add(60 * time.Second))
 
-	br := bufio.NewReader(conn)
+	br := bufio.NewReaderSize(conn, 4096)
 	req, err := http.ReadRequest(br)
 	if err != nil {
 		return
 	}
 
-	// Basic auth check if proxy auth configured
 	if proxyAuth != "" {
 		auth := req.Header.Get("Proxy-Authorization")
 		if auth == "" || !checkProxyAuth(auth) {
@@ -40,35 +49,45 @@ func HandleHTTP(conn net.Conn, dns *DNSCache) {
 	if req.Method == http.MethodConnect {
 		handleConnect(conn, req, dns)
 	} else {
-		handleHTTP(conn, req, dns)
+		handleHTTP(conn, req, dns, br)
 	}
 }
 
 func handleConnect(conn net.Conn, req *http.Request, dns *DNSCache) {
 	host := req.Host
 	if !hasPort(host) {
-		host = host + ":443"
+		host += ":443"
 	}
 
-	target, err := dialWithCache(host, dns)
+	target, err := dialTarget(host, dns)
 	if err != nil {
 		log.Printf("CONNECT dial %s: %v", host, err)
 		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return
 	}
 	defer target.Close()
+	target.(*net.TCPConn).SetNoDelay(true)
 
 	conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 
-	// Bidirectional copy
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { io.Copy(target, conn); wg.Done() }()
-	go func() { io.Copy(conn, target); wg.Done() }()
+	go func() {
+		buf := *bufPool.Get().(*[]byte)
+		defer bufPool.Put(&buf)
+		io.CopyBuffer(target, conn, buf)
+		wg.Done()
+	}()
+	go func() {
+		buf := *bufPool.Get().(*[]byte)
+		defer bufPool.Put(&buf)
+		io.CopyBuffer(conn, target, buf)
+		wg.Done()
+	}()
 	wg.Wait()
 }
 
-func handleHTTP(conn net.Conn, req *http.Request, dns *DNSCache) {
+func handleHTTP(conn net.Conn, req *http.Request, dns *DNSCache, br *bufio.Reader) {
 	host := req.URL.Host
 	if !hasPort(host) {
 		port := "80"
@@ -78,7 +97,7 @@ func handleHTTP(conn net.Conn, req *http.Request, dns *DNSCache) {
 		host = host + ":" + port
 	}
 
-	target, err := dialWithCache(host, dns)
+	target, err := dialTarget(host, dns)
 	if err != nil {
 		log.Printf("HTTP dial %s: %v", host, err)
 		resp := &http.Response{
@@ -91,14 +110,16 @@ func handleHTTP(conn net.Conn, req *http.Request, dns *DNSCache) {
 		return
 	}
 	defer target.Close()
+	target.(*net.TCPConn).SetNoDelay(true)
 
-	// Rewrite URL to remove scheme+host for proxy request
 	req.RequestURI = req.URL.RequestURI()
 	req.Header.Del("Proxy-Connection")
 	req.Header.Del("Proxy-Authorization")
-	req.Write(target)
+	if err := req.Write(target); err != nil {
+		return
+	}
 
-	resp, err := http.ReadResponse(bufio.NewReader(target), req)
+	resp, err := http.ReadResponse(bufio.NewReaderSize(target, 4096), req)
 	if err != nil {
 		return
 	}
@@ -106,13 +127,12 @@ func handleHTTP(conn net.Conn, req *http.Request, dns *DNSCache) {
 	resp.Write(conn)
 }
 
-func dialWithCache(host string, dns *DNSCache) (net.Conn, error) {
+func dialTarget(host string, dns *DNSCache) (net.Conn, error) {
 	hostname, port, err := net.SplitHostPort(host)
 	if err != nil {
 		return nil, err
 	}
 
-	// Try DNS cache
 	if ip := dns.Lookup(hostname); ip != "" {
 		addr := net.JoinHostPort(ip, port)
 		conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
@@ -121,10 +141,8 @@ func dialWithCache(host string, dns *DNSCache) (net.Conn, error) {
 		}
 	}
 
-	// Fallback to normal DNS
 	conn, err := net.DialTimeout("tcp", host, 10*time.Second)
 	if err == nil {
-		// Cache the resolved IP asynchronously
 		go dns.CacheLookup(hostname)
 	}
 	return conn, err
@@ -132,12 +150,6 @@ func dialWithCache(host string, dns *DNSCache) (net.Conn, error) {
 
 func hasPort(host string) bool {
 	return strings.LastIndex(host, ":") > strings.LastIndex(host, "]")
-}
-
-var proxyAuth string
-
-func SetProxyAuth(auth string) {
-	proxyAuth = auth
 }
 
 func checkProxyAuth(authHeader string) bool {

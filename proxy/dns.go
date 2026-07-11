@@ -2,131 +2,164 @@ package proxy
 
 import (
 	"encoding/binary"
-	"log"
 	"math/rand"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 type DNSCache struct {
 	upstream string
 	mu       sync.RWMutex
-	entries  map[string]dnsEntry
+	entries  [8192]dnsSlot
+	misses   atomic.Int64
+	hits     atomic.Int64
 }
 
-type dnsEntry struct {
+type dnsSlot struct {
+	hash   uint64
+	name   string
 	ip     string
-	expiry time.Time
+	expiry int64
 }
 
 func NewDNSCache(upstream string) *DNSCache {
-	return &DNSCache{
-		upstream: upstream,
-		entries:  make(map[string]dnsEntry, 256),
-	}
+	return &DNSCache{upstream: upstream}
 }
 
 func (c *DNSCache) Prewarm() {
-	domains := []string{"google.com", "youtube.com", "facebook.com", "wikipedia.org", "amazon.com"}
+	domains := []string{"google.com", "youtube.com", "facebook.com", "wikipedia.org", "amazon.com", "cloudflare.com", "github.com"}
 	for _, d := range domains {
 		c.CacheLookup(d)
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 	}
-	log.Printf("DNS cache prewarmed %d domains", len(domains))
 }
 
 func (c *DNSCache) Lookup(host string) string {
+	h := hashStr(host)
+	now := time.Now().UnixNano()
 	c.mu.RLock()
-	e, ok := c.entries[host]
-	c.mu.RUnlock()
-	if ok && time.Now().Before(e.expiry) {
-		return e.ip
+	for i := 0; i < 8; i++ {
+		s := &c.entries[(int(h)+i)&8191]
+		if s.hash == h && s.name == host && now < s.expiry {
+			ip := s.ip
+			c.mu.RUnlock()
+			c.hits.Add(1)
+			return ip
+		}
 	}
+	c.mu.RUnlock()
 	return ""
 }
 
 func (c *DNSCache) CacheLookup(host string) {
 	ip, ttl, err := c.resolve(host)
-	if err != nil || ip == "" {
+	if err != nil || ip == "" || ttl < 1 {
 		return
 	}
+	h := hashStr(host)
+	exp := time.Now().UnixNano() + int64(ttl)*1e9
 	c.mu.Lock()
-	c.entries[host] = dnsEntry{ip: ip, expiry: time.Now().Add(time.Duration(ttl) * time.Second)}
+	for i := 0; i < 8; i++ {
+		s := &c.entries[(int(h)+i)&8191]
+		if s.hash == 0 && s.name == "" {
+			s.hash = h; s.name = host; s.ip = ip; s.expiry = exp
+			c.mu.Unlock()
+			return
+		}
+		if s.hash == h && s.name == host {
+			s.ip = ip; s.expiry = exp
+			c.mu.Unlock()
+			return
+		}
+	}
+	idx := int(h) & 8191
+	c.entries[idx].hash = h; c.entries[idx].name = host; c.entries[idx].ip = ip; c.entries[idx].expiry = exp
 	c.mu.Unlock()
 }
 
-func (c *DNSCache) resolve(host string) (string, uint32, error) {
-	// Build DNS query
-	id := uint16(rand.Intn(65536))
-	q := make([]byte, 12+len(host)+2+4)
-	binary.BigEndian.PutUint16(q[0:2], id)
-	q[2] = 1   // RD
-	q[5] = 1   // QDCOUNT = 1
+func hashStr(s string) uint64 {
+	var h uint64 = 14695981039346656037
+	for i := 0; i < len(s); i++ {
+		h ^= uint64(s[i])
+		h *= 1099511628211
+	}
+	return h
+}
 
-	// Encode domain name
+func (c *DNSCache) resolve(host string) (string, uint32, error) {
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.String(), 3600, nil
+	}
+
+	id := uint16(rand.Intn(65536))
+	q := dnsBufPool.Get().(*[]byte)
+	defer dnsBufPool.Put(q)
+	buf := *q
+
+	binary.BigEndian.PutUint16(buf[0:2], id)
+	buf[2] = 1
+	binary.BigEndian.PutUint16(buf[4:6], 1)
+
 	pos := 12
 	for _, label := range splitLabels(host) {
-		q[pos] = byte(len(label))
+		buf[pos] = byte(len(label))
 		pos++
-		copy(q[pos:], label)
+		copy(buf[pos:], label)
 		pos += len(label)
 	}
-	q[pos] = 0; pos++ // root
-	binary.BigEndian.PutUint16(q[pos:pos+2], 1)   // QTYPE A
-	binary.BigEndian.PutUint16(q[pos+2:pos+4], 1) // QCLASS IN
+	buf[pos] = 0; pos++
+	binary.BigEndian.PutUint16(buf[pos:pos+2], 1)
+	binary.BigEndian.PutUint16(buf[pos+2:pos+4], 1)
+	pos += 4
 
-	conn, err := net.DialTimeout("udp", c.upstream, 5*time.Second)
+	conn, err := net.DialTimeout("udp", c.upstream, 3*time.Second)
 	if err != nil {
 		return "", 0, err
 	}
 	defer conn.Close()
-
-	conn.SetDeadline(time.Now().Add(5 * time.Second))
-	_, err = conn.Write(q)
-	if err != nil {
+	conn.SetDeadline(time.Now().Add(3 * time.Second))
+	if _, err := conn.Write(buf[:pos]); err != nil {
 		return "", 0, err
 	}
 
-	resp := make([]byte, 512)
-	n, err := conn.Read(resp)
+	n, err := conn.Read(buf)
 	if err != nil || n < 12 {
 		return "", 0, err
 	}
 
-	// Parse response - find first A record
-	anCount := int(binary.BigEndian.Uint16(resp[6:8]))
+	anCount := int(binary.BigEndian.Uint16(buf[6:8]))
 	if anCount == 0 {
 		return "", 0, nil
 	}
 
-	// Skip question section
 	off := 12
-	off = skipName(resp, off, n)
-	off += 4 // QTYPE + QCLASS
-
-	// Parse answer records
+	off = skipDNSName(buf, off, n)
+	off += 4
 	for i := 0; i < anCount; i++ {
 		if off >= n {
 			break
 		}
-		off = skipName(resp, off, n)
+		off = skipDNSName(buf, off, n)
 		if off+10 > n {
 			break
 		}
-		rtype := int(binary.BigEndian.Uint16(resp[off : off+2]))
-		rclass := int(binary.BigEndian.Uint16(resp[off+2 : off+4]))
-		ttl := binary.BigEndian.Uint32(resp[off+4 : off+8])
-		rdlen := int(binary.BigEndian.Uint16(resp[off+8 : off+10]))
+		rtype := int(binary.BigEndian.Uint16(buf[off:]))
+		rclass := int(binary.BigEndian.Uint16(buf[off+2:]))
+		ttl := binary.BigEndian.Uint32(buf[off+4:])
+		rdlen := int(binary.BigEndian.Uint16(buf[off+8:]))
 		off += 10
 		if rtype == 1 && rclass == 1 && rdlen == 4 && off+4 <= n {
-			ip := net.IP(resp[off : off+4]).String()
-			return ip, ttl, nil
+			return net.IP(buf[off:off+4]).String(), ttl, nil
 		}
 		off += rdlen
 	}
-
 	return "", 0, nil
+}
+
+var dnsBufPool = sync.Pool{
+	New: func() any { b := make([]byte, 512); return &b },
 }
 
 func splitLabels(host string) []string {
@@ -143,7 +176,7 @@ func splitLabels(host string) []string {
 	return labels
 }
 
-func skipName(data []byte, off, max int) int {
+func skipDNSName(data []byte, off, max int) int {
 	for off < max {
 		b := data[off]
 		if b == 0 {
