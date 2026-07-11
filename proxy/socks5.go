@@ -6,7 +6,6 @@ import (
 	"log"
 	"net"
 	"strconv"
-	"sync"
 	"time"
 )
 
@@ -25,7 +24,11 @@ var socksAuth string
 func SetSocksAuth(auth string) { socksAuth = auth }
 
 func HandleSOCKS5(conn net.Conn, dns *DNSCache) {
+	ConnTotal.Add(1)
+	ConnActive.Add(1)
+	defer ConnActive.Add(-1)
 	defer conn.Close()
+
 	tcpConn := conn.(*net.TCPConn)
 	tcpConn.SetNoDelay(true)
 	tcpConn.SetKeepAlive(true)
@@ -140,17 +143,25 @@ func HandleSOCKS5(conn net.Conn, dns *DNSCache) {
 	port = int(binary.BigEndian.Uint16(buf[:2]))
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
 
+	if Verbose.Load() {
+		log.Printf("> SOCKS5 %s:%d", host, port)
+	}
+
 	if atyp == socksAtypDomain {
 		if ip := dns.Lookup(host); ip != "" {
+			dnsCacheHits.Add(1)
 			addr = net.JoinHostPort(ip, strconv.Itoa(port))
 		} else {
+			dnsCacheMisses.Add(1)
 			go dns.CacheLookup(host)
 		}
 	}
 
 	target, err := net.DialTimeout("tcp", addr, 10*time.Second)
 	if err != nil {
-		log.Printf("SOCKS5 dial %s: %v", addr, err)
+		if Verbose.Load() {
+			log.Printf("! SOCKS5 dial %s: %v", addr, err)
+		}
 		conn.Write([]byte{socksVer5, 1, 0, 1, 0, 0, 0, 0, 0, 0})
 		return
 	}
@@ -163,19 +174,5 @@ func HandleSOCKS5(conn net.Conn, dns *DNSCache) {
 	resp = append(resp, byte(local.Port>>8), byte(local.Port))
 	conn.Write(resp)
 
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		b := *bufPool.Get().(*[]byte)
-		defer bufPool.Put(&b)
-		io.CopyBuffer(target, conn, b)
-		wg.Done()
-	}()
-	go func() {
-		b := *bufPool.Get().(*[]byte)
-		defer bufPool.Put(&b)
-		io.CopyBuffer(conn, target, b)
-		wg.Done()
-	}()
-	wg.Wait()
+	tunnel(conn, target)
 }

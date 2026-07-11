@@ -5,7 +5,6 @@ import (
 	"math/rand"
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -13,8 +12,6 @@ type DNSCache struct {
 	upstream string
 	mu       sync.RWMutex
 	entries  [8192]dnsSlot
-	misses   atomic.Int64
-	hits     atomic.Int64
 }
 
 type dnsSlot struct {
@@ -45,7 +42,6 @@ func (c *DNSCache) Lookup(host string) string {
 		if s.hash == h && s.name == host && now < s.expiry {
 			ip := s.ip
 			c.mu.RUnlock()
-			c.hits.Add(1)
 			return ip
 		}
 	}
@@ -63,7 +59,7 @@ func (c *DNSCache) CacheLookup(host string) {
 	c.mu.Lock()
 	for i := 0; i < 8; i++ {
 		s := &c.entries[(int(h)+i)&8191]
-		if s.hash == 0 && s.name == "" {
+		if s.hash == 0 && len(s.name) == 0 {
 			s.hash = h; s.name = host; s.ip = ip; s.expiry = exp
 			c.mu.Unlock()
 			return

@@ -19,9 +19,14 @@ func main() {
 	dnsAddr := flag.String("dns", "1.1.1.1:53", "Upstream DNS")
 	bind := flag.String("bind", "0.0.0.0", "Bind address")
 	auth := flag.String("auth", "", "Proxy auth user:pass")
+	verbose := flag.Bool("v", false, "Verbose connection logging")
 	flag.Parse()
 
 	log.SetFlags(log.Ldate | log.Ltime)
+
+	if *verbose {
+		proxy.Verbose.Store(true)
+	}
 
 	if *auth != "" {
 		parts := strings.SplitN(*auth, ":", 2)
@@ -44,13 +49,13 @@ func main() {
 		proxy.HandleSOCKS5(conn, dnsCache)
 	})
 
-	log.Printf("netproxy ready — http :%d, socks5 :%d, dns %s", *httpPort, *socksPort, *dnsAddr)
+	log.Printf("ready — http :%d, socks5 :%d, dns %s", *httpPort, *socksPort, *dnsAddr)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt)
 	<-sig
-	log.Println("shutdown")
-	time.Sleep(100 * time.Millisecond)
+	log.Printf("shutdown (%d active connections)", proxy.ConnActive.Load())
+	time.Sleep(500 * time.Millisecond)
 }
 
 func startProxy(name, bind string, port int, handler func(net.Conn)) {
